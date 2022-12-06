@@ -60,110 +60,17 @@ type ApiClient struct {
 
 func NewApiClientFunc(version string) func(context.Context, *schema.ResourceData) (interface{}, diag.Diagnostics) {
 	return func(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
-		var diags diag.Diagnostics
-		config := elasticsearch.Config{}
-		config.Header = http.Header{"User-Agent": []string{fmt.Sprintf("elasticstack-terraform-provider/%s", version)}}
+		config, diags := newEsConfigFromResourceData(d, "elasticsearch", version, true)
 
-		if v, ok := d.GetOk("elasticsearch"); ok {
-			// if defined we must have only one entry
-			if esc := v.([]interface{})[0]; esc != nil {
-				esConfig := esc.(map[string]interface{})
-				if username, ok := esConfig["username"]; ok {
-					config.Username = username.(string)
-				}
-				if password, ok := esConfig["password"]; ok {
-					config.Password = password.(string)
-				}
-				if apikey, ok := esConfig["api_key"]; ok {
-					config.APIKey = apikey.(string)
-				}
-
-				// default endpoints taken from Env if set
-				if es := os.Getenv("ELASTICSEARCH_ENDPOINTS"); es != "" {
-					endpoints := make([]string, 0)
-					for _, e := range strings.Split(es, ",") {
-						endpoints = append(endpoints, strings.TrimSpace(e))
-					}
-					config.Addresses = endpoints
-				}
-				// setting endpoints from config block if provided
-				if eps, ok := esConfig["endpoints"]; ok && len(eps.([]interface{})) > 0 {
-					endpoints := make([]string, 0)
-					for _, e := range eps.([]interface{}) {
-						endpoints = append(endpoints, e.(string))
-					}
-					config.Addresses = endpoints
-				}
-
-				if insecure, ok := esConfig["insecure"]; ok && insecure.(bool) {
-					tlsClientConfig := ensureTLSClientConfig(&config)
-					tlsClientConfig.InsecureSkipVerify = true
-				}
-
-				if caFile, ok := esConfig["ca_file"]; ok && caFile.(string) != "" {
-					caCert, err := os.ReadFile(caFile.(string))
-					if err != nil {
-						diags = append(diags, diag.Diagnostic{
-							Severity: diag.Error,
-							Summary:  "Unable to read CA File",
-							Detail:   err.Error(),
-						})
-						return nil, diags
-					}
-					config.CACert = caCert
-				}
-				if caData, ok := esConfig["ca_data"]; ok && caData.(string) != "" {
-					config.CACert = []byte(caData.(string))
-				}
-
-				if certFile, ok := esConfig["cert_file"]; ok && certFile.(string) != "" {
-					if keyFile, ok := esConfig["key_file"]; ok && keyFile.(string) != "" {
-						cert, err := tls.LoadX509KeyPair(certFile.(string), keyFile.(string))
-						if err != nil {
-							diags = append(diags, diag.Diagnostic{
-								Severity: diag.Error,
-								Summary:  "Unable to read certificate or key file",
-								Detail:   err.Error(),
-							})
-							return nil, diags
-						}
-						tlsClientConfig := ensureTLSClientConfig(&config)
-						tlsClientConfig.Certificates = []tls.Certificate{cert}
-					} else {
-						diags = append(diags, diag.Diagnostic{
-							Severity: diag.Error,
-							Summary:  "Unable to read key file",
-							Detail:   "Path to key file has not been configured or is empty",
-						})
-						return nil, diags
-					}
-				}
-				if certData, ok := esConfig["cert_data"]; ok && certData.(string) != "" {
-					if keyData, ok := esConfig["key_data"]; ok && keyData.(string) != "" {
-						cert, err := tls.X509KeyPair([]byte(certData.(string)), []byte(keyData.(string)))
-						if err != nil {
-							diags = append(diags, diag.Diagnostic{
-								Severity: diag.Error,
-								Summary:  "Unable to parse certificate or key",
-								Detail:   err.Error(),
-							})
-							return nil, diags
-						}
-						tlsClientConfig := ensureTLSClientConfig(&config)
-						tlsClientConfig.Certificates = []tls.Certificate{cert}
-					} else {
-						diags = append(diags, diag.Diagnostic{
-							Severity: diag.Error,
-							Summary:  "Unable to parse key",
-							Detail:   "Key data has not been configured or is empty",
-						})
-						return nil, diags
-					}
-				}
-			}
+		if diags.HasError() {
+			return nil, diags
 		}
 
-		es, err := elasticsearch.NewClient(config)
+		if config == nil {
+			return nil, diag.Errorf("Unable to read connection config for provider")
+		}
+
+		es, err := elasticsearch.NewClient(*config)
 		if err != nil {
 			diags = append(diags, diag.Diagnostic{
 				Severity: diag.Error,
@@ -205,75 +112,18 @@ func NewAcceptanceTestingClient() (*ApiClient, error) {
 	return &ApiClient{es, "acceptance-testing"}, nil
 }
 
-func NewApiClient(d *schema.ResourceData, meta interface{}) (*ApiClient, error) {
+func NewApiClient(d *schema.ResourceData, meta interface{}) (*ApiClient, diag.Diagnostics) {
 	defaultClient := meta.(*ApiClient)
+	resourceConfig, diags := newEsConfigFromResourceData(d, "elasticsearch_connection", defaultClient.version, false)
+	if diags.HasError() {
+		return nil, diags
+	}
+
 	// if the config provided let's use it
-	if esConn, ok := d.GetOk("elasticsearch_connection"); ok {
-		config := elasticsearch.Config{}
-		config.Header = http.Header{"User-Agent": []string{fmt.Sprintf("elasticstack-terraform-provider/%s", defaultClient.version)}}
-
-		// there is always only 1 connection per resource
-		conn := esConn.([]interface{})[0].(map[string]interface{})
-
-		if u := conn["username"]; u != nil {
-			config.Username = u.(string)
-		}
-		if p := conn["password"]; p != nil {
-			config.Password = p.(string)
-		}
-		if k := conn["api_key"]; k != nil {
-			config.APIKey = k.(string)
-		}
-		if endpoints := conn["endpoints"]; endpoints != nil {
-			var addrs []string
-			for _, e := range endpoints.([]interface{}) {
-				addrs = append(addrs, e.(string))
-			}
-			config.Addresses = addrs
-		}
-		if insecure := conn["insecure"]; insecure.(bool) {
-			tlsClientConfig := ensureTLSClientConfig(&config)
-			tlsClientConfig.InsecureSkipVerify = true
-		}
-		if caFile, ok := conn["ca_file"]; ok && caFile.(string) != "" {
-			caCert, err := os.ReadFile(caFile.(string))
-			if err != nil {
-				return nil, fmt.Errorf("Unable to read ca_file: %w", err)
-			}
-			config.CACert = caCert
-		}
-		if caData, ok := conn["ca_data"]; ok && caData.(string) != "" {
-			config.CACert = []byte(caData.(string))
-		}
-
-		if certFile, ok := conn["cert_file"]; ok && certFile.(string) != "" {
-			if keyFile, ok := conn["key_file"]; ok && keyFile.(string) != "" {
-				cert, err := tls.LoadX509KeyPair(certFile.(string), keyFile.(string))
-				if err != nil {
-					return nil, fmt.Errorf("Unable to read certificate or key file: %w", err)
-				}
-				tlsClientConfig := ensureTLSClientConfig(&config)
-				tlsClientConfig.Certificates = []tls.Certificate{cert}
-			} else {
-				return nil, fmt.Errorf("Unable to read key file: Path to key file has not been configured or is empty")
-			}
-		}
-		if certData, ok := conn["cert_data"]; ok && certData.(string) != "" {
-			if keyData, ok := conn["key_data"]; ok && keyData.(string) != "" {
-				cert, err := tls.X509KeyPair([]byte(certData.(string)), []byte(keyData.(string)))
-				if err != nil {
-					return nil, fmt.Errorf("Unable to parse certificate or key: %w", err)
-				}
-				tlsClientConfig := ensureTLSClientConfig(&config)
-				tlsClientConfig.Certificates = []tls.Certificate{cert}
-			} else {
-				return nil, fmt.Errorf("Unable to parse key: Key data has not been configured or is empty")
-			}
-		}
-
-		es, err := elasticsearch.NewClient(config)
+	if resourceConfig != nil {
+		es, err := elasticsearch.NewClient(*resourceConfig)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to create Elasticsearch client")
+			return nil, diag.Errorf("Unable to create Elasticsearch client %s", err)
 		}
 		if logging.IsDebugOrHigher() {
 			es.Transport = newDebugTransport("elasticsearch", es.Transport)
@@ -282,6 +132,111 @@ func NewApiClient(d *schema.ResourceData, meta interface{}) (*ApiClient, error) 
 	} else { // or return the default client
 		return defaultClient, nil
 	}
+}
+
+func newEsConfigFromResourceData(d *schema.ResourceData, fieldName string, version string, useEnvAsDefault bool) (*elasticsearch.Config, diag.Diagnostics) {
+	providerConfigs, ok := d.GetOk(fieldName)
+	if !ok {
+		return nil, nil
+	}
+
+	config := elasticsearch.Config{}
+	config.Header = http.Header{"User-Agent": []string{fmt.Sprintf("elasticstack-terraform-provider/%s", version)}}
+
+	providerConfig, ok := providerConfigs.([]interface{})[0].(map[string]interface{})
+	if !ok || providerConfig == nil {
+		return nil, diag.Errorf("could not read connection configuration from module")
+	}
+
+	if username, ok := providerConfig["username"]; ok {
+		config.Username = username.(string)
+	}
+	if password, ok := providerConfig["password"]; ok {
+		config.Password = password.(string)
+	}
+	if apikey, ok := providerConfig["api_key"]; ok {
+		config.APIKey = apikey.(string)
+	}
+
+	// default endpoints taken from Env if set
+	if es := os.Getenv("ELASTICSEARCH_ENDPOINTS"); useEnvAsDefault && es != "" {
+		endpoints := make([]string, 0)
+		for _, e := range strings.Split(es, ",") {
+			endpoints = append(endpoints, strings.TrimSpace(e))
+		}
+		config.Addresses = endpoints
+	}
+	// setting endpoints from config block if provided
+	if eps, ok := providerConfig["endpoints"]; ok && len(eps.([]interface{})) > 0 {
+		endpoints := make([]string, 0)
+		for _, e := range eps.([]interface{}) {
+			endpoints = append(endpoints, e.(string))
+		}
+		config.Addresses = endpoints
+	}
+
+	if insecure, ok := providerConfig["insecure"]; ok && insecure.(bool) {
+		tlsClientConfig := ensureTLSClientConfig(&config)
+		tlsClientConfig.InsecureSkipVerify = true
+	}
+
+	if caFile, ok := providerConfig["ca_file"]; ok && caFile.(string) != "" {
+		caCert, err := os.ReadFile(caFile.(string))
+		if err != nil {
+			return nil, diag.Diagnostics{diag.Diagnostic{
+				Severity: diag.Error,
+				Summary:  "Unable to read CA File",
+				Detail:   err.Error(),
+			}}
+		}
+		config.CACert = caCert
+	}
+	if caData, ok := providerConfig["ca_data"]; ok && caData.(string) != "" {
+		config.CACert = []byte(caData.(string))
+	}
+
+	if certFile, ok := providerConfig["cert_file"]; ok && certFile.(string) != "" {
+		if keyFile, ok := providerConfig["key_file"]; ok && keyFile.(string) != "" {
+			cert, err := tls.LoadX509KeyPair(certFile.(string), keyFile.(string))
+			if err != nil {
+				return nil, diag.Diagnostics{diag.Diagnostic{
+					Severity: diag.Error,
+					Summary:  "Unable to read certificate or key file",
+					Detail:   err.Error(),
+				}}
+			}
+			tlsClientConfig := ensureTLSClientConfig(&config)
+			tlsClientConfig.Certificates = []tls.Certificate{cert}
+		} else {
+			return nil, diag.Diagnostics{diag.Diagnostic{
+				Severity: diag.Error,
+				Summary:  "Unable to read key file",
+				Detail:   "Path to key file has not been configured or is empty",
+			}}
+		}
+	}
+	if certData, ok := providerConfig["cert_data"]; ok && certData.(string) != "" {
+		if keyData, ok := providerConfig["key_data"]; ok && keyData.(string) != "" {
+			cert, err := tls.X509KeyPair([]byte(certData.(string)), []byte(keyData.(string)))
+			if err != nil {
+				return nil, diag.Diagnostics{diag.Diagnostic{
+					Severity: diag.Error,
+					Summary:  "Unable to parse certificate or key",
+					Detail:   err.Error(),
+				}}
+			}
+			tlsClientConfig := ensureTLSClientConfig(&config)
+			tlsClientConfig.Certificates = []tls.Certificate{cert}
+		} else {
+			return nil, diag.Diagnostics{diag.Diagnostic{
+				Severity: diag.Error,
+				Summary:  "Unable to parse key",
+				Detail:   "Key data has not been configured or is empty",
+			}}
+		}
+	}
+
+	return &config, nil
 }
 
 func ensureTLSClientConfig(config *elasticsearch.Config) *tls.Config {
